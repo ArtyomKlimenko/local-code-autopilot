@@ -46,8 +46,19 @@ After reviewer approval, the supervisor reloads `.agent/tasks.json` and starts t
 
 ## No-progress protection
 
-There is no global iteration, tool-call, compaction, or wall-clock limit. A
-long task may continue as long as it makes new observations or changes.
+There is no global iteration, tool-call, or wall-clock limit. A long task may
+continue as long as it makes new observations or changes.
+
+## Context handoff
+
+Pi auto-compaction is disabled. The supervisor watches the local llama-server
+slot and, at `contextHandoffTokens` (by default 65% of `contextWindow`), saves
+the durable checkpoint, stops the current Pi process, and starts a clean
+session for the same task. It also treats an unexpected compaction request or
+two consecutive unstructured `agent_settled` events as an immediate handoff.
+This prevents a failed model-generated summary from looping forever. It is a
+session rotation, not a task or iteration limit: task work continues from
+`PLAN.md`, project files, and the checkpoint.
 
 The only automatic interruption is semantic: if the exact same bash command
 gets the exact same result twice without a successful project `write` or

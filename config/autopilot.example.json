@@ -15,6 +15,7 @@
   "model": "your-local-model",
   "thinking": "high",
   "contextWindow": 24576,
+  "contextHandoffTokens": 15974,
   "executionPolicy": "progress-checkpointed-unbounded",
   "attemptTimeoutMinutes": null,
   "remoteHost": "user@vm-host",

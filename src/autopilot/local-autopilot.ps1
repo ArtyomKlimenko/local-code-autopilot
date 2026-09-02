@@ -200,6 +200,7 @@ $prompt
     model = "ornith-1.5-9b-abliterated"
     thinking = "high"
     contextWindow = $ctx
+    contextHandoffTokens = [math]::Floor($ctx * 0.65)
     executionPolicy = "bootstrap-planned-progress-checkpointed-unbounded"
     attemptTimeoutMinutes = $null
     remoteHost = $remoteInfo.Host

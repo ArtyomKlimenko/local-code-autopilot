@@ -50,6 +50,16 @@ function numericLimit(value) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : Number.POSITIVE_INFINITY;
 }
 
+function contextHandoffLimit(config) {
+  const contextWindow = Number(config.contextWindow) || 24576;
+  const configured = Number(config.contextHandoffTokens);
+  if (Number.isFinite(configured) && configured >= 4096 && configured < contextWindow) {
+    return Math.floor(configured);
+  }
+  // Leave enough room for a final tool result; do not rely on model-generated compaction.
+  return Math.max(4096, Math.floor(contextWindow * 0.65));
+}
+
 function processAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -344,7 +354,7 @@ function buildWorkerPrompt(task, attempt, previousIssues) {
       "- Keep tasks small enough that a reviewer can verify each one independently.",
       "- Put investigation, implementation, tests, deployment, and documentation into separate tasks when the goal is broad.",
     ] : []),
-    `This is recovery pass ${attempt}. There is no attempt, tool-call, compaction, or wall-clock limit. Continue until the task is verified complete or blocked by a real external requirement.`,
+    `This is recovery pass ${attempt}. There is no attempt, tool-call, or wall-clock limit. The supervisor may rotate this session before its context overflows; persist concrete results in project files and the checkpoint so a fresh session can continue. Continue until the task is verified complete or blocked by a real external requirement.`,
     previousIssues.length ? "Issues from the previous rejected attempt:" : "There is no previous rejected attempt.",
     ...previousIssues.map((item) => `- ${item}`),
     checkpoint ? "Durable checkpoint from the previous pass (verify it; do not repeat completed work):" : "There is no durable checkpoint from an earlier pass.",
@@ -524,6 +534,7 @@ async function runPi({ role, task, attempt, prompt }) {
   let abortReason = "";
   let toolCalls = 0;
   let compactions = 0;
+  let settledWithoutResult = 0;
   let noProgressLoop = false;
   let lastAssistantText = "";
   const recentEvents = [];
@@ -559,12 +570,36 @@ async function runPi({ role, task, attempt, prompt }) {
   };
 
   const attemptTimeoutMinutes = numericLimit(config.attemptTimeoutMinutes);
+  const handoffTokens = contextHandoffLimit(config);
+  let contextCheckInFlight = false;
   const timeout = Number.isFinite(attemptTimeoutMinutes)
     ? setTimeout(() => abort(`attempt exceeded ${config.attemptTimeoutMinutes} minutes`), attemptTimeoutMinutes * 60_000)
     : null;
   const stopPoll = setInterval(() => {
     if (existsSync(stopPath) || interrupted) abort(existsSync(stopPath) ? "stop requested" : "interrupted");
   }, 1000);
+  const contextPoll = setInterval(async () => {
+    if (abortReason || contextCheckInFlight) return;
+    contextCheckInFlight = true;
+    try {
+      const response = await fetch("http://127.0.0.1:8080/slots", { signal: AbortSignal.timeout(1500) });
+      if (!response.ok) return;
+      const slots = await response.json();
+      const activeSlot = Array.isArray(slots)
+        ? slots.find((slot) => slot?.is_processing && Number.isFinite(Number(slot?.n_prompt_tokens)))
+        : null;
+      const promptTokens = Number(activeSlot?.n_prompt_tokens);
+      if (Number.isFinite(promptTokens) && promptTokens >= handoffTokens) {
+        recentEvents.push({ at: now(), type: "context_handoff", promptTokens, threshold: handoffTokens });
+        saveCheckpoint("context-handoff");
+        abort(`context handoff: ${promptTokens} prompt tokens reached the ${handoffTokens} safe-session threshold`);
+      }
+    } catch {
+      // The server can be busy loading or ending a request. A later poll will retry.
+    } finally {
+      contextCheckInFlight = false;
+    }
+  }, 2000);
 
   child.stderr.on("data", (chunk) => appendFileSync(stderrLog, chunk));
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
@@ -614,15 +649,18 @@ async function runPi({ role, task, attempt, prompt }) {
       }
     } else if (event.type === "compaction_start") {
       compactions += 1;
-      process.stdout.write(`[autopilot] compaction ${compactions}\n`);
-      recentEvents.push({ at: now(), type: "compaction", number: compactions });
-      saveCheckpoint("compacting");
+      recentEvents.push({ at: now(), type: "compaction-blocked", number: compactions });
+      saveCheckpoint("context-handoff");
+      abort("context handoff: automatic compaction was requested; preserving the checkpoint and starting a clean session instead");
     } else if (event.type === "agent_settled") {
       settled = true;
       saveCheckpoint("settled-without-result");
       if (existsSync(resultFile)) {
         child.kill();
+      } else if (compactions > 0 || settledWithoutResult >= 1) {
+        abort("context handoff: session settled repeatedly without a structured result");
       } else {
+        settledWithoutResult += 1;
         setTimeout(() => send({
           id: `continue-${Date.now()}`,
           type: "prompt",
@@ -642,7 +680,7 @@ async function runPi({ role, task, attempt, prompt }) {
 
   send({ type: "set_steering_mode", mode: "one-at-a-time" });
   send({ type: "set_follow_up_mode", mode: "one-at-a-time" });
-  send({ type: "set_auto_compaction", enabled: true });
+  send({ type: "set_auto_compaction", enabled: false });
   send({ id: "task-prompt", type: "prompt", message: prompt });
 
   await new Promise((resolvePromise) => {
@@ -653,6 +691,7 @@ async function runPi({ role, task, attempt, prompt }) {
   });
   if (timeout) clearTimeout(timeout);
   clearInterval(stopPoll);
+  clearInterval(contextPoll);
   lines.close();
   activeChild = null;
 
@@ -664,7 +703,10 @@ async function runPi({ role, task, attempt, prompt }) {
       abortReason ||= `invalid result JSON: ${error.message}`;
     }
   }
-  return { result, settled, exitCode, abortReason, toolCalls, compactions, noProgressLoop, rpcLog, stderrLog };
+  return {
+    result, settled, exitCode, abortReason, toolCalls, compactions, noProgressLoop,
+    contextHandoff: abortReason.startsWith("context handoff:"), rpcLog, stderrLog,
+  };
 }
 
 async function main() {
@@ -713,6 +755,11 @@ async function main() {
         const workerFailure = worker.abortReason || `worker exited without finish_step (exit=${worker.exitCode}, settled=${worker.settled})`;
         taskState.lastIssues = [workerFailure];
         saveState(state, `Worker attempt ${taskState.attempts} failed without a structured result`);
+        if (worker.contextHandoff) {
+          saveState(state, `Context handoff for task ${task.id}; continuing from durable checkpoint in a clean session`);
+          process.stdout.write(`[autopilot] CONTEXT HANDOFF ${task.id}: clean session will resume from checkpoint\n`);
+          continue;
+        }
         if (worker.noProgressLoop) {
           saveState(state, `Recovery planner is reframing stalled task ${task.id}`);
           const recovery = await runPi({
@@ -768,6 +815,9 @@ async function main() {
       if (!review.result) {
         taskState.lastIssues = [review.abortReason || `reviewer exited without finish_review (exit=${review.exitCode})`];
         saveState(state, `Review attempt ${taskState.attempts} failed without a verdict`);
+        if (review.contextHandoff) {
+          saveState(state, `Reviewer context handoff for task ${task.id}; retrying independent review in a clean session`);
+        }
         continue;
       }
       if (!review.result.approved) {
