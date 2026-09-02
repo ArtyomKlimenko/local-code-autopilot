@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "projectRoot": "C:\\work\\my-project",
+  "tasksFile": ".agent/tasks.json",
+  "goalFile": ".agent/GOAL.md",
+  "planFile": "PLAN.md",
+  "stateFile": ".agent/state.json",
+  "journalFile": ".agent/journal.md",
+  "runDirectory": "C:\\LocalAI\\autopilot\\runs\\my-project",
+  "piSessionDirectory": "C:\\LocalAI\\sessions\\autopilot-my-project",
+  "nodeExecutable": "C:\\LocalAI\\runtime\\node\\node.exe",
+  "piCli": "C:\\LocalAI\\pi\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+  "extension": "C:\\LocalAI\\autopilot\\pi-autopilot-extension.ts",
+  "provider": "local-code",
+  "model": "your-local-model",
+  "thinking": "high",
+  "contextWindow": 24576,
+  "executionPolicy": "progress-checkpointed-unbounded",
+  "attemptTimeoutMinutes": null,
+  "remoteHost": "user@vm-host",
+  "remoteCwd": "/home/user/my-project",
+  "sshKeyPath": "C:\\Users\\your-user\\.ssh\\id_ed25519"
+}

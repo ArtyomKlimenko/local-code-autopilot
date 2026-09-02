@@ -1,0 +1,28 @@
+# Local runtimes and model weights
+runtime/
+models/
+downloads/
+pi/
+
+# Generated state
+logs/
+sessions/
+state/
+autopilot/runs/
+*.log
+*.pid
+
+# Secrets and machine-specific configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_ed25519*
+config/*.local.json
+
+# Editor and OS files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
