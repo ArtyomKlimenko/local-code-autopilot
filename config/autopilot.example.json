@@ -6,6 +6,7 @@
   "planFile": "PLAN.md",
   "stateFile": ".agent/state.json",
   "journalFile": ".agent/journal.md",
+  "userActionFile": ".agent/USER_ACTION_REQUIRED.md",
   "runDirectory": "C:\\LocalAI\\autopilot\\runs\\my-project",
   "piSessionDirectory": "C:\\LocalAI\\sessions\\autopilot-my-project",
   "nodeExecutable": "C:\\LocalAI\\runtime\\node\\node.exe",

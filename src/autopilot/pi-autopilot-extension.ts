@@ -19,6 +19,7 @@ import { Type } from "typebox";
 
 const resultFile = process.env.LOCAL_AUTOPILOT_RESULT_FILE || "";
 const activityFile = process.env.LOCAL_AUTOPILOT_ACTIVITY_FILE || "";
+const actionFile = process.env.LOCAL_AUTOPILOT_ACTION_FILE || "";
 const role = process.env.LOCAL_AUTOPILOT_ROLE || "worker";
 const taskId = process.env.LOCAL_AUTOPILOT_TASK_ID || "unknown";
 const remoteHost = process.env.LOCAL_AUTOPILOT_REMOTE_HOST || "";
@@ -282,6 +283,69 @@ const finishStep = defineTool({
 	},
 });
 
+const requestUserAction = defineTool({
+	name: "request_user_action",
+	label: "Request user action",
+	description: "Stop the current task and record the exact external action required from the user.",
+	promptSnippet: "Stop for a real external dependency and request a safe, concrete user action",
+	promptGuidelines: [
+		"Call this immediately when the task cannot be verified without a real account login, proxy endpoint, model endpoint, user approval, or another external value the project does not contain.",
+		"Never ask the user to paste passwords, private keys, session cookies, or tokens into chat, logs, or the repository.",
+		"Give the smallest concrete manual action and a verification condition for resuming.",
+	],
+	parameters: Type.Object({
+		title: Type.String({ description: "Short title of the dependency" }),
+		reason: Type.String({ description: "Why the task cannot safely continue" }),
+		requiredActions: Type.Array(Type.String(), { description: "Concrete safe actions for the user" }),
+		verificationAfter: Type.Array(Type.String(), { description: "What the agent should verify once the user acts" }),
+	}),
+	async execute(_id, params) {
+		const value = {
+			kind: "worker",
+			taskId,
+			at: new Date().toISOString(),
+			status: "blocked",
+			summary: `User action required: ${params.title}`,
+			changedFiles: [],
+			verification: [],
+			evidence: [],
+			blocker: params.reason,
+			actionFile,
+			requiredActions: params.requiredActions,
+			verificationAfter: params.verificationAfter,
+		};
+		if (actionFile) {
+			mkdirSync(dirname(actionFile), { recursive: true });
+			writeFileSync(actionFile, [
+				"# User Action Required",
+				"",
+				`Task: ${taskId}`,
+				`Updated: ${value.at}`,
+				"",
+				`## ${params.title}`,
+				"",
+				params.reason,
+				"",
+				"## Do This",
+				...params.requiredActions.map((item, index) => `${index + 1}. ${item}`),
+				"",
+				"## Resume Verification",
+				...params.verificationAfter.map((item) => `- ${item}`),
+				"",
+				"Do not place passwords, private keys, session cookies, or access tokens in this file, the repository, or agent chat output.",
+				"",
+			].join("\n"), "utf8");
+		}
+		saveJson(resultFile, value);
+		logActivity({ type: "request_user_action", taskId, title: params.title, actionFile });
+		return {
+			content: [{ type: "text", text: `User action request saved for ${taskId}: ${params.title}` }],
+			details: value,
+			terminate: true,
+		};
+	},
+});
+
 const finishReview = defineTool({
 	name: "finish_review",
 	label: "Finish review",
@@ -352,6 +416,7 @@ export default function (pi: ExtensionAPI) {
 		pi.registerTool(createWriteTool(localCwd, { operations: createRemoteWriteOps(localCwd, progress) }));
 		pi.registerTool(createEditTool(localCwd, { operations: createRemoteEditOps(localCwd, progress) }));
 		pi.registerTool(finishStep);
+		pi.registerTool(requestUserAction);
 	}
 
 	pi.on("before_agent_start", async (event) => ({

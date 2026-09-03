@@ -191,6 +191,7 @@ $prompt
     planFile = "PLAN.md"
     stateFile = ".agent/state.json"
     journalFile = ".agent/journal.md"
+    userActionFile = ".agent/USER_ACTION_REQUIRED.md"
     runDirectory = $runDir
     piSessionDirectory = $sessionDir
     nodeExecutable = $NodeExe

@@ -60,6 +60,19 @@ This prevents a failed model-generated summary from looping forever. It is a
 session rotation, not a task or iteration limit: task work continues from
 `PLAN.md`, project files, and the checkpoint.
 
+## When you must act
+
+When a task requires a real external prerequisite that is not present, such as
+an interactive account login, a proxy/model endpoint, a safe configuration
+choice, or explicit approval, the worker calls `request_user_action`. This
+stops the whole autopilot in `blocked` state and writes a concrete checklist to
+`<project>\.agent\USER_ACTION_REQUIRED.md`. The same reason and file path are
+shown by `local-autopilot status`.
+
+Complete the listed manual action, without placing passwords, private keys,
+session cookies, or access tokens in the project or chat. Then start the same
+autopilot again; it resumes the blocked task from its checkpoint.
+
 The only automatic interruption is semantic: if the exact same bash command
 gets the exact same result twice without a successful project `write` or
 `edit`, the third identical retry is rejected. The current worker is then
