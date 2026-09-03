@@ -69,6 +69,11 @@ stops the whole autopilot in `blocked` state and writes a concrete checklist to
 `<project>\.agent\USER_ACTION_REQUIRED.md`. The same reason and file path are
 shown by `local-autopilot status`.
 
+It does not stop for ordinary code failures, failing tests, safely creatable
+files, or routine uncertainty. The worker first performs one focused check;
+only proof that an acceptance criterion depends on an external user action can
+block the run.
+
 Complete the listed manual action, without placing passwords, private keys,
 session cookies, or access tokens in the project or chat. Then start the same
 autopilot again; it resumes the blocked task from its checkpoint.

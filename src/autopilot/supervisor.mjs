@@ -363,7 +363,7 @@ function buildWorkerPrompt(task, attempt, previousIssues) {
     "Work in small verified edits. Keep every command and its output bounded. To check a server, start it in the background, retain its PID, poll its health endpoint with a bounded client, then clean up that PID with a trap. A foreground `timeout` followed by curl only proves the server was killed; do not use that pattern as a health check.",
     "After a rejected pass, repair the listed issue first. Do not restart broad discovery or rewrite working parts.",
     "Do not merely describe intended work. Make the in-scope changes and run focused verification.",
-    "If a real external dependency is missing (for example a proxy endpoint, an account login, model endpoint, or explicit approval), do not guess, fabricate configuration, or repeat discovery. Call request_user_action immediately with the smallest safe action the user must take. Never request secrets in chat, logs, or repository files.",
+    "Use request_user_action only after one focused check proves that an acceptance criterion cannot be met without a real external dependency (for example a proxy endpoint, account login, model endpoint, or explicit approval). Do not call it for code defects, failing tests, safely creatable project files, or ordinary uncertainty: repair or investigate those normally. Once the external dependency is proven missing, do not guess, fabricate configuration, or repeat discovery; request the smallest safe user action. Never request secrets in chat, logs, or repository files.",
     "When verification passes, call finish_step. If your turn ends without it, the supervisor will continue the same session from its durable checkpoint.",
   ].join("\n");
 }
@@ -486,7 +486,7 @@ async function runPi({ role, task, attempt, prompt }) {
       : "VM project files and project-owned user services may be modified when the assigned task calls for it. Never change Windows host state, VirtualBox/host networking, VM firewall/networking, unrelated VM files, real browser-login profile data, or credentials.",
     `End only through ${finishTool} or request_user_action.`,
     role === "worker"
-      ? "When an external prerequisite is missing, end through request_user_action rather than guessing or repeating inspection."
+      ? "Use request_user_action only for a proven external prerequisite, never for ordinary failures. Once proven, end through request_user_action rather than guessing or repeating inspection."
       : "",
   ].join(" ");
 

@@ -289,7 +289,8 @@ const requestUserAction = defineTool({
 	description: "Stop the current task and record the exact external action required from the user.",
 	promptSnippet: "Stop for a real external dependency and request a safe, concrete user action",
 	promptGuidelines: [
-		"Call this immediately when the task cannot be verified without a real account login, proxy endpoint, model endpoint, user approval, or another external value the project does not contain.",
+		"Call this only after one focused check confirms that the task acceptance criteria cannot be met without a real account login, proxy endpoint, model endpoint, explicit user approval, or another external value the project does not contain.",
+		"Do not call this for a normal code defect, a failing test, a missing project file that can safely be created, an ordinary investigation step, or uncertainty that a bounded read/test can resolve.",
 		"Never ask the user to paste passwords, private keys, session cookies, or tokens into chat, logs, or the repository.",
 		"Give the smallest concrete manual action and a verification condition for resuming.",
 	],
