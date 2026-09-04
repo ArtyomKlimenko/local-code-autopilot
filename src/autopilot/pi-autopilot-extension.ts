@@ -167,13 +167,25 @@ function remotePath(path: string, localCwd: string): string {
 	return `${remoteCwd}/${normalized.replace(/^\.\//, "")}`;
 }
 
+function isRemoteControlPath(path: string, localCwd: string): boolean {
+	const target = remotePath(path, localCwd).replace(/\/+$/, "");
+	return target === `${remoteCwd}/PLAN.md` || target === `${remoteCwd}/.agent` || target.startsWith(`${remoteCwd}/.agent/`);
+}
+
+function assertRemoteProjectPath(path: string, localCwd: string): string {
+	if (isRemoteControlPath(path, localCwd)) {
+		throw new Error("Remote .agent and PLAN.md are reserved for the remote project. This run's plan and state are local only.");
+	}
+	return remotePath(path, localCwd);
+}
+
 function createRemoteReadOps(localCwd: string): ReadOperations {
 	return {
-		readFile: (path) => sshExec(`cat ${JSON.stringify(remotePath(path, localCwd))}`),
-		access: (path) => sshExec(`test -r ${JSON.stringify(remotePath(path, localCwd))}`).then(() => {}),
+		readFile: (path) => sshExec(`cat ${JSON.stringify(assertRemoteProjectPath(path, localCwd))}`),
+		access: (path) => sshExec(`test -r ${JSON.stringify(assertRemoteProjectPath(path, localCwd))}`).then(() => {}),
 		detectImageMimeType: async (path) => {
 			try {
-				const result = await sshExec(`file --mime-type -b ${JSON.stringify(remotePath(path, localCwd))}`);
+				const result = await sshExec(`file --mime-type -b ${JSON.stringify(assertRemoteProjectPath(path, localCwd))}`);
 				const mime = result.toString().trim();
 				return ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mime) ? mime : null;
 			} catch {
@@ -187,10 +199,10 @@ function createRemoteWriteOps(localCwd: string, progress: NoProgressGuard): Writ
 	return {
 		writeFile: async (path, content) => {
 			const encoded = Buffer.from(content).toString("base64");
-			await sshExec(`printf %s ${JSON.stringify(encoded)} | base64 -d > ${JSON.stringify(remotePath(path, localCwd))}`);
+			await sshExec(`printf %s ${JSON.stringify(encoded)} | base64 -d > ${JSON.stringify(assertRemoteProjectPath(path, localCwd))}`);
 			progress.markProjectChange();
 		},
-		mkdir: (path) => sshExec(`mkdir -p ${JSON.stringify(remotePath(path, localCwd))}`).then(() => progress.markProjectChange()),
+		mkdir: (path) => sshExec(`mkdir -p ${JSON.stringify(assertRemoteProjectPath(path, localCwd))}`).then(() => progress.markProjectChange()),
 	};
 }
 
@@ -204,7 +216,9 @@ function createRemoteBashOps(localCwd: string, progress: NoProgressGuard): BashO
 	return {
 		exec: (command, cwd, { onData, signal, timeout }) =>
 			new Promise((resolve, reject) => {
-				const blocked = dangerousCommand(command);
+				const blocked = dangerousCommand(command) || (/(?:^|[\s\"'`/])(?:\.agent(?:[\\/\s\"'`]|$)|PLAN\.md(?:[\s\"'`]|$))/i.test(command)
+					? "Remote .agent and PLAN.md are reserved for the remote project. This run's plan and state are local only."
+					: null);
 				if (blocked) {
 					reject(new Error(blocked));
 					return;
@@ -493,10 +507,16 @@ export default function (pi: ExtensionAPI) {
 			if (/id_ed25519(?:\.|$)/i.test(path) || /^[A-Za-z]:\//.test(path.replace(/\\/g, "/"))) {
 				return { block: true, reason: "Read only project files on the Debian VM. Private key contents and Windows files are unavailable." };
 			}
+			if (isRemoteControlPath(path, localCwd)) {
+				return { block: true, reason: "Remote .agent and PLAN.md are reserved for the remote project. This run's plan and state are local only." };
+			}
 		}
 
 		if (isToolCallEventType("bash", event)) {
-			const blocked = dangerousCommand(String(event.input.command || ""));
+			const command = String(event.input.command || "");
+			const blocked = dangerousCommand(command) || (/(?:^|[\s\"'`/])(?:\.agent(?:[\\/\s\"'`]|$)|PLAN\.md(?:[\s\"'`]|$))/i.test(command)
+				? "Remote .agent and PLAN.md are reserved for the remote project. This run's plan and state are local only."
+				: null);
 			if (blocked) return { block: true, reason: blocked };
 		}
 	});

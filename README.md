@@ -38,9 +38,10 @@ See [docs/AUTOPILOT.md](docs/AUTOPILOT.md) for the planner-first workflow.
 ## Security model
 
 The remote extension refuses private-key reads, broad scans, destructive
-commands, browser-profile cache reads, and unsafe `pkill -f` cleanup. It uses
-the SSH key only as a path passed to OpenSSH. It does not upload the key or its
-contents to the model.
+commands, browser-profile cache reads, unsafe `pkill -f` cleanup, and access
+to remote `.agent/` or `PLAN.md` control files. Autopilot plans and state are
+always stored in the local control project. It uses the SSH key only as a path
+passed to OpenSSH. It does not upload the key or its contents to the model.
 
 This is an agent harness, not a security boundary. Give its VM account only
 the access that the task actually needs.

@@ -21,6 +21,19 @@ least be the sandbox directory where the agent is allowed to create them.
 `local-autopilot new` creates local control files (`.agent/*`, `PLAN.md`) and
 points the tools at the remote VM path; it does not copy a whole project tree.
 
+## Control project and remote project
+
+The first path passed to `new` is always the **local control project** for that
+run. It is the durable home for `GOAL.md`, `PLAN.md`, `tasks.json`, state,
+journal, checkpoints, and any `USER_ACTION_REQUIRED.md` file. The `--remote`
+path is only the code and execution sandbox.
+
+The extension blocks `read`, `write`, `edit`, and ordinary `bash` access to a
+remote `.agent/` directory and remote `PLAN.md`. Those files may belong to a
+different run or a project-native workflow; they are never the autopilot's
+plan. Use one new local control directory per independent task, even when
+several tasks use the same remote repository.
+
 ## Commands
 
 ```cmd
@@ -41,7 +54,8 @@ local-autopilot stop <project-folder|autopilot.json>
 ```
 
 The initial `tasks.json` contains only `0.1 Bootstrap planning from GOAL.md`.
-That planner task may edit `PLAN.md` and `.agent/tasks.json`.
+That planner task saves its plan and generated task list into the local control
+project only.
 After reviewer approval, the supervisor reloads `.agent/tasks.json` and starts the generated task list.
 
 ## No-progress protection
