@@ -20,6 +20,7 @@ foreach ($name in @("server.mjs", "feed.mjs", "launcher-helper.mjs", "start-web.
 }
 Copy-Item -LiteralPath (Join-Path $source "dist") -Destination $destination -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $repo "docs\WEB_UI.md") -Destination (Join-Path $destination "README.md") -Force
+Copy-Item -LiteralPath (Join-Path $repo "docs\PIPELINE.md") -Destination (Join-Path $destination "PIPELINE.md") -Force
 @{ projectsRoot = $resolvedProjects; port = $Port } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $destination "machine.json") -Encoding UTF8
 $taskUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $principal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited

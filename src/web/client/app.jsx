@@ -118,6 +118,8 @@ function App() {
   const active = Boolean(project?.isRunning || project?.isLaunching);
   const visibleProjects = projects.filter(item => item.name.toLowerCase().includes(search.toLowerCase()) || item.projectRoot.toLowerCase().includes(search.toLowerCase()));
   const currentTask = project?.currentTask;
+  const planning = project?.planning;
+  const planTasks = planning ? planning.tasks : project?.tasks || [];
   const entries = feed.entries.filter(entry => filter === "all" || (filter === "tools" ? entry.kind === "tool" : entry.kind === "error" || entry.status === "error"));
   const latest = !run;
   const activityLabel = active ? project.isLaunching && !project.isRunning ? "Проверки GPU и загрузка модели" : phases[feed.phase] || "В работе" : statuses[project?.status] || "Ожидает запуска";
@@ -132,7 +134,7 @@ function App() {
       <nav class="project-list">
         {visibleProjects.map(item => <button key={item.id} class={"project-item " + (item.id === selected ? "selected" : "")} onClick={() => setSelected(item.id)}>
           <span class={"project-dot " + item.status}>{item.status === "complete" ? <CheckCircle2 size={16} /> : item.isRunning || item.isLaunching ? <LoaderCircle class="spin" size={16} /> : <MessageSquare size={16} />}</span>
-          <span class="project-item-text"><strong>{item.name}</strong><small>{statuses[item.status] || item.status}<span>{item.done}/{item.total}</span></small></span>
+          <span class="project-item-text"><strong>{item.name}</strong><small>{statuses[item.status] || item.status}{!item.planning && <span>{item.done}/{item.total}</span>}</small></span>
         </button>)}
         {!visibleProjects.length && <p class="sidebar-empty">Задачи не найдены</p>}
       </nav>
@@ -154,7 +156,7 @@ function App() {
         <div class="workspace-body">
           <section class="main-panel">
             <div class="tabs" role="tablist">{[
-              ["activity", Activity, "Ход работы"], ["plan", ListChecks, "План", project.total], ["goal", FileText, "Задача"], ["journal", History, "Журнал"]
+              ["activity", Activity, "Ход работы"], ["plan", ListChecks, planning ? "Подготовка плана" : "План", planning ? planTasks.length || undefined : project.total], ["goal", FileText, "Задача"], ["journal", History, "Журнал"]
             ].map(([id, Icon, label, count]) => <button role="tab" aria-selected={tab === id} class={tab === id ? "active" : ""} onClick={() => setTab(id)}><Icon size={15} />{label}{count !== undefined && <span>{count}</span>}</button>)}</div>
             {project.userAction && project.status === "blocked" && <div class="user-action"><TriangleAlert size={18} /><div><strong>Агенту нужно ваше действие</strong><Markdown text={project.userAction} /></div></div>}
             {project.status === "waiting-user" && currentTask?.requiresUserApproval && <div class="user-action"><TriangleAlert size={18} /><div><strong>Разрешить шаг {currentTask.id}?</strong><p>{currentTask.scope}</p><button class="button" disabled={busy} onClick={() => action(async () => { setProject(await api("/projects/" + selected + "/approve", { taskId: currentTask.id })); }, "Разрешение сохранено. Можно продолжить задачу.")}><Check size={15} />Разрешить этот шаг</button></div></div>}
@@ -179,7 +181,21 @@ function App() {
                 {project.notes.length > 0 && <details class="notes-history"><summary>Уточнения · {project.notes.length}</summary>{project.notes.map(item => <div><span>{new Date(item.at).toLocaleString("ru-RU")} · {({ pending: "Ожидает", queued: "В очереди Pi", included: "Включено в контекст", delivered: "Получено агентом" })[item.status] || item.status}</span><p>{item.text}</p></div>)}</details>}
               </form>
             </>}
-            {tab === "plan" && <div class="document-scroll"><div class="document-header"><div><h2>План выполнения</h2><p>{project.done} из {project.total} шагов завершено</p></div><CopyButton text={project.plan} label="Копировать план" /></div><div class="progress-track"><span style={{ width: (project.total ? project.done / project.total * 100 : 0) + "%" }} /></div><div class="task-list">{project.tasks.map(task => <details class={"task-step " + task.status} open={task.id === project.currentTaskId}><summary>{task.status === "done" ? <CheckCircle2 size={18} /> : task.status === "running" && active ? <LoaderCircle size={18} class="spin" /> : <Circle size={18} />}<span class="task-id">{task.id}</span><strong>{task.title}</strong><ChevronRight size={15} /></summary><div><p>{task.scope}</p><h3>Критерии результата</h3><ul>{task.acceptance?.map(item => <li>{item}</li>)}</ul>{task.lastIssues?.length > 0 && <div class="task-issues"><h3>Последние замечания</h3>{task.lastIssues.map(item => <p>{item}</p>)}</div>}<small>Проходов: {task.attempts || 0}{task.requiresUserApproval ? " · Требуется действие пользователя" : ""}</small></div></details>)}</div><details class="raw-plan"><summary>Полный текст плана</summary><Markdown text={project.plan} /></details></div>}
+            {tab === "plan" && <div class="document-scroll">
+              <div class="document-header"><div><h2>{planning ? "Подготовка плана" : "План выполнения"}</h2><p>{planning
+                ? planning.phase === "empty" ? "Агент составляет план; этап 0.1 служебный" : (planning.phase === "review" ? "На проверке" : "Черновик, ещё не принят") + " · Шагов: " + planTasks.length
+                : `${project.done} из ${project.total} шагов завершено`}</p></div>{!planning && <CopyButton text={project.plan} label="Копировать план" />}</div>
+              {planning?.summary && <Markdown text={planning.summary} />}
+              {!planning && <div class="progress-track"><span style={{ width: (project.total ? project.done / project.total * 100 : 0) + "%" }} /></div>}
+              <div class="task-list">{planTasks.map(task => <details key={(planning ? "draft-" : "task-") + task.id} class={"task-step " + (planning ? "pending" : task.status)} open={!planning && task.id === project.currentTaskId}>
+                <summary>{!planning && task.status === "done" ? <CheckCircle2 size={18} /> : !planning && task.status === "running" && active ? <LoaderCircle size={18} class="spin" /> : <Circle size={18} />}<span class="task-id">{task.id}</span><strong>{task.title}</strong><ChevronRight size={15} /></summary>
+                <div><p>{task.scope}</p><h3>Критерии результата</h3><ul>{task.acceptance?.map(item => <li>{item}</li>)}</ul>{!planning && task.lastIssues?.length > 0 && <div class="task-issues"><h3>Последние замечания</h3>{task.lastIssues.map(item => <p>{item}</p>)}</div>}{planning
+                  ? task.requiresUserApproval && <small>Потребуется разрешение пользователя</small>
+                  : <small>Проходов: {task.attempts || 0}{task.requiresUserApproval ? " · Требуется действие пользователя" : ""}</small>}</div>
+              </details>)}</div>
+              {planning ? planning.revision && <details class="raw-plan"><summary>Данные локального плана</summary><div class="path-label">Ревизия</div><div class="path-value"><code>{planning.revision}</code><CopyButton text={planning.revision} /></div><div class="path-label">SHA-256 задачи</div><div class="path-value"><code>{planning.goalHash}</code><CopyButton text={planning.goalHash} /></div></details>
+                : <details class="raw-plan"><summary>Полный текст плана</summary><Markdown text={project.plan} /></details>}
+            </div>}
             {tab === "goal" && <div class="document-scroll"><div class="document-header"><div><h2>Исходная задача</h2><p>Локальная папка: {project.projectRoot}</p></div><button class="button" disabled={active || !project.tasks.some(task => task.id === "0.1" && task.canManagePlan)} onClick={() => setModal("goal")}><Settings2 size={15} />Редактировать</button></div><Markdown text={project.goal} /></div>}
             {tab === "journal" && <div class="document-scroll"><div class="document-header"><h2>Проверенные результаты</h2><CopyButton text={project.journal} /></div>{project.journal ? <Markdown text={project.journal} /> : <Empty icon={History} title="Результатов пока нет" text="Здесь появятся итоги шагов после проверки." />}</div>}
           </section>

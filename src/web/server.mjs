@@ -98,6 +98,26 @@ function runsFor(config) {
     });
   } catch { return []; }
 }
+function projectPlanning(config, definitions) {
+  if (!definitions.tasks.some(task => task.canManagePlan === true || task.kind === "planner")) return null;
+  const empty = { phase: "empty", tasks: [], summary: "", revision: null, goalHash: null };
+  let goalHash;
+  try {
+    // Preserve BOM and newlines to match plan-store's raw UTF-8 goal digest.
+    goalHash = createHash("sha256").update(readFileSync(projectFile(config, "goalFile", ".agent/GOAL.md"), "utf8")).digest("hex");
+  } catch { return empty; }
+  const directory = join(config.projectRoot, ".agent", "planning");
+  const current = value => value?.goalHash === goalHash && Array.isArray(value.tasks)
+    && typeof value.summary === "string" && typeof value.revision === "string" ? value : null;
+  const draft = current(json(join(directory, "draft.json")));
+  const proposal = current(json(join(directory, "proposal.json")));
+  const plan = draft || proposal;
+  if (!plan) return { ...empty, goalHash };
+  return {
+    phase: proposal?.revision === plan.revision ? "review" : "draft",
+    tasks: plan.tasks, summary: plan.summary, revision: plan.revision, goalHash,
+  };
+}
 function projectSummary(id) {
   const { config } = lookup(id);
   const state = json(projectFile(config, "stateFile", ".agent/state.json"), { status: "ready", tasks: [] });
@@ -110,6 +130,7 @@ function projectSummary(id) {
   if (isRunning && existsSync(join(config.runDirectory, "stop.request"))) status = "stopping";
   if (launch?.status === "error" && !isRunning) status = "error";
   const definitions = json(projectFile(config, "tasksFile", ".agent/tasks.json"), { tasks: [] });
+  const planning = projectPlanning(config, definitions);
   const tasks = definitions.tasks.map(task => ({ ...task, ...(state.tasks || []).find(item => item.id === task.id) }));
   const currentTask = tasks.find(task => task.id === state.currentTaskId) || (state.tasks || []).find(task => task.id === state.currentTaskId) || null;
   return {
@@ -118,6 +139,7 @@ function projectSummary(id) {
     status, isRunning, isLaunching, currentTaskId: state.currentTaskId,
     updatedAt: state.updatedAt, lastMessage: launch?.status === "error" && !isRunning ? launch.error : state.lastMessage,
     done: tasks.filter(task => task.status === "done").length, total: tasks.length, tasks, currentTask,
+    ...(planning ? { planning } : {}),
     model: config.model, thinking: config.thinking, contextWindow: config.contextWindow,
     contextHandoffTokens: config.contextHandoffTokens, sshKeyPath: config.sshKeyPath,
   };

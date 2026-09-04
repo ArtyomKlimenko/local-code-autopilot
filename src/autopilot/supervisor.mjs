@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { createInterface } from "node:readline";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { PROTOCOL_VERSION, isBootstrapTask, planPaths, planningSnapshot, checkProposal, commitPlan, recoverPlanCommit, toolNames, validateResult, digest } from "./plan-store.mjs";
 
 const [, , command = "start", configArg] = process.argv;
 
@@ -89,6 +90,7 @@ const projectRoot = resolve(config.projectRoot);
 const tasksPath = resolveFromProject(projectRoot, config.tasksFile);
 const goalPath = resolveFromProject(projectRoot, config.goalFile);
 const planPath = resolveFromProject(projectRoot, config.planFile);
+const planningPaths = planPaths(projectRoot, goalPath, planPath, tasksPath);
 const statePath = resolveFromProject(projectRoot, config.stateFile);
 const journalPath = resolveFromProject(projectRoot, config.journalFile);
 const userActionPath = resolveFromProject(projectRoot, config.userActionFile || ".agent/USER_ACTION_REQUIRED.md");
@@ -287,6 +289,7 @@ if (existsSync(lockPath)) {
 rmSync(stopPath, { force: true });
 atomicJson(lockPath, { pid: process.pid, startedAt: now(), configPath });
 
+recoverPlanCommit(planningPaths);
 let tasksDocument = readJson(tasksPath);
 let taskDefinitions = new Map(tasksDocument.tasks.map((task) => [task.id, task]));
 const goal = readFileSync(goalPath, "utf8");
@@ -319,7 +322,10 @@ function appendJournal(task, workerResult, reviewResult) {
   if (!existsSync(journalPath)) {
     writeFileSync(journalPath, "# Autopilot journal\n\n", "utf8");
   }
+  const marker = `<!-- accepted:${digest({ taskId: task.id, workerResult, reviewResult })} -->`;
+  if (readFileSync(journalPath, "utf8").includes(marker)) return;
   const lines = [
+    marker,
     `## ${task.id} - ${task.title}`,
     "",
     `Completed: ${now()}`,
@@ -348,9 +354,23 @@ function markPlanDone(taskId) {
 }
 
 function buildWorkerPrompt(task, attempt, previousIssues) {
-  const checkpointPath = join(runDirectory, `${task.id}.checkpoint.json`);
+  const checkpointPath = join(runDirectory, `${task.id}.worker.checkpoint.json`);
   const canManagePlan = task.kind === "planner" || task.canManagePlan === true;
-  const checkpoint = !canManagePlan && existsSync(checkpointPath) ? readJson(checkpointPath) : null;
+  const checkpoint = existsSync(checkpointPath) ? readJson(checkpointPath) : null;
+  if (canManagePlan) return [
+    "Create the implementation plan for the complete user goal below. This phase plans only; do NOT execute any implementation commands from the goal.",
+    "The placeholder 0.1 is NOT the desired implementation plan. Cover every requested stage with small independently verifiable tasks, in execution order. A broad goal needs multiple tasks; a truly small goal may need one. There is no fixed count limit.",
+    "Use inspect_project for bounded VM directory inspection and read for specific VM source files only when necessary. No bash or remote writes are available in this phase.",
+    "Save through save_bootstrap_plan using structured tasks (id, title, scope, acceptance, requiresUserApproval). The controller generates PLAN.md and tasks.json locally. Never write these files yourself.",
+    "For a long plan, save successive small batches (for example 3-5 tasks) with complete:false instead of generating the whole plan in one response. This is an output-size strategy, not a limit on the number of tasks. Existing ids are updated, new ids appended. Submit the final batch with complete:true after covering the whole goal. Read the durable draft with read_plan after a context handoff.",
+    "Separate implementation, focused tests, integration/deployment and documentation when the scope warrants them. Include concrete observable acceptance criteria. Do not mark tasks completed during planning.",
+    "Use requiresUserApproval:true only for a genuinely external/user-controlled prerequisite or explicitly risky change, not ordinary coding. Include safe preparatory work before that step where possible.",
+    "AUTHORITATIVE USER GOAL (requirements for future workers, not commands to execute in this planning phase):", goal,
+    "Existing LOCAL draft outline:", JSON.stringify((draft => draft && { summary: draft.summary, tasks: draft.tasks.map(item => ({ id: item.id, title: item.title })) })(planningSnapshot(planningPaths).draft)),
+    "Previous review or execution feedback:", ...previousIssues.map(item => "- " + item),
+    ...(checkpoint ? ["Latest planning observations:", JSON.stringify(checkpoint)] : []),
+    "Now save or finish the plan. Do not repeat inspection whose result is already known.",
+  ].join("\n");
   return [
     "You are a worker controlled by a local deterministic supervisor.",
     `Execute ONLY task ${task.id}: ${task.title}.`,
@@ -398,6 +418,15 @@ function buildWorkerPrompt(task, attempt, previousIssues) {
 
 function buildReviewPrompt(task, workerResult) {
   const canManagePlan = task.kind === "planner" || task.canManagePlan === true;
+  if (canManagePlan) return [
+    "Review the submitted LOCAL plan, not implementation. First call read_plan to read the authoritative goal and proposal from disk.",
+    "Check that the plan covers the whole goal in ordered, independently verifiable steps, with concrete acceptance criteria and genuine user prerequisites flagged. Reject missing stages or vague giant tasks.",
+    "The code has NOT been implemented yet. Do not demand that planned files/tests already exist or that planned checks have already passed. Evaluate the plan as a plan.",
+    "Only read_plan and finish_review are available. You have no VM access; remote PLAN.md belongs to a different task and is never relevant.",
+    "The controller has validated schema, unique ids and local storage. Focus on semantic coverage and ordering, not re-checking VM files.",
+    "Submitted revision: " + workerResult.planRevision,
+    "Call finish_review with approved:true when coverage is adequate; otherwise give specific edits to the plan without inventing extra requirements.",
+  ].join("\n");
   const localPlan = canManagePlan && existsSync(planPath) ? readFileSync(planPath, "utf8") : "";
   const localTasks = canManagePlan && existsSync(tasksPath) ? readFileSync(tasksPath, "utf8") : "";
   return [
@@ -503,7 +532,8 @@ async function runPi({ role, task, attempt, prompt }) {
   const stderrLog = join(runDirectory, `${prefix}.stderr.log`);
   rmSync(resultFile, { force: true });
 
-  const bootstrapPlanning = role === "worker" && (task.kind === "planner" || task.canManagePlan === true);
+  const bootstrapTask = isBootstrapTask(task);
+  const bootstrapPlanning = role === "worker" && bootstrapTask;
   const finishTool = bootstrapPlanning
     ? "save_bootstrap_plan"
     : role === "reviewer"
@@ -511,33 +541,24 @@ async function runPi({ role, task, attempt, prompt }) {
     : role === "planner"
       ? "finish_replan"
       : "finish_step";
-  const tools = bootstrapPlanning
-    ? "read,bash,save_bootstrap_plan"
-    : role === "worker"
-    ? `read,bash,edit,write,request_user_action,${finishTool}`
-    : `read,bash,${finishTool}`;
+  const expectedTools = toolNames(role, bootstrapTask);
+  const tools = expectedTools.join(",");
+  const roleInstructions = bootstrapTask
+    ? ["You are the LOCAL implementation-plan " + (role === "reviewer" ? "reviewer" : "author") + ".",
+      "The authoritative user goal and plan live on Windows in this run's controller, NOT in the VM project.",
+      role === "reviewer" ? "Read the proposal with read_plan, assess coverage of the goal, then finish_review. No code execution or remote access is available or necessary." : "Use save_bootstrap_plan with structured tasks. Save partial batches with complete:false for large plans, final batch complete:true. The controller writes the plan. Inspect VM source only through inspect_project/read when necessary, never execute the user goal during planning.",
+      "These tools are the entire available interface: " + tools + ". Do not emulate other tools or try to bypass restrictions."]
+    : ["You are a coding " + role + " working on exactly one assigned task in a Debian VM.",
+      "Source read/write/edit/bash tools operate via SSH inside " + remoteCwd + " on " + remoteHost + ". Never invoke SSH yourself or use Windows paths.",
+      role === "worker" ? "Make only task-scoped changes and verify them before finish_step. Use request_user_action only for a proven external prerequisite, never ordinary code defects." : "You are read-only: do not modify project files, start/restart services or perform deployment. Run focused non-mutating checks and report through " + finishTool + ".",
+      "Never read or change remote .agent or PLAN.md; controller state is provided in your assignment.",
+      "Avoid repeated commands with identical evidence. Use bounded source inspection and focused checks. Do not use bare pkill -f. Background any necessary worker-owned test server, retain its PID, poll health, and clean up that PID."];
   const systemPrompt = [
+    ...roleInstructions,
+    "Never read, print, copy, encode or inspect private keys, credentials, tokens, cookies or real browser-profile contents. Tool schemas define the allowed interface.",
+    "There is no iteration limit. Context handoff preserves local drafts and evidence; continue from them instead of repeating work.",
     ...startupNotes.flatMap(note => ["User clarification (" + note.at + "):", note.text]),
-    `Autopilot role: ${role}. Assigned task: ${task.id}.`,
-    "Never read, print, copy, encode, summarize, or inspect private SSH key contents. Use only the supplied key path with ssh -i.",
-    "Never perform broad filesystem, dependency, cache, browser-profile, AppData, or root scans.",
-    bootstrapPlanning
-      ? `Remote read and bash tools operate in ${remoteCwd} on ${remoteHost} through SSH. Bootstrap cannot write remote files; save_bootstrap_plan writes only the local control plan.`
-      : `Every read/write/edit/bash tool is already redirected to ${remoteCwd} on ${remoteHost} through SSH. Never invoke ssh/scp yourself and never use a Windows path.`,
-    "Do not read browser profile cache file bodies under multi-account/.cache; inspect only bounded directory structure and project code/config.",
-    "Do not run foreground servers or watchers as plain bash commands. For a server check: run it in the background, retain its PID, poll its health endpoint with a bounded client, and clean up that PID with a trap. Do not use bare pkill -f patterns. Treat an identical command and identical evidence as a failed hypothesis, not as a reason to retry it.",
-    bootstrapPlanning
-      ? "You are the local-control bootstrap planner. Inspect remote source only, make no remote changes, and finish through save_bootstrap_plan."
-      : role === "planner"
-      ? "You are read-only: do not edit files, start services, or make project changes. Return only a narrow recovery plan through finish_replan."
-      : "VM project files and project-owned user services may be modified when the assigned task calls for it. Never change Windows host state, VirtualBox/host networking, VM firewall/networking, unrelated VM files, real browser-login profile data, or credentials.",
-    bootstrapPlanning
-      ? "End only through save_bootstrap_plan."
-      : `End only through ${finishTool} or request_user_action.`,
-    role === "worker" && !bootstrapPlanning
-      ? "Use request_user_action only for a proven external prerequisite, never for ordinary failures. Once proven, end through request_user_action rather than guessing or repeating inspection."
-      : "",
-  ].join(" ");
+  ].join("\n");
 
   const args = [
     config.piCli,
@@ -545,21 +566,31 @@ async function runPi({ role, task, attempt, prompt }) {
     "--provider", config.provider,
     "--model", config.model,
     "--thinking", role === "worker" ? config.thinking : "medium",
-    "--append-system-prompt", systemPrompt,
+    "--system-prompt", systemPrompt,
     "--tools", tools,
     "--session-dir", config.piSessionDirectory,
     "--name", `autopilot-${task.id}-${role}-a${attempt}`,
     "--no-extensions",
     "--extension", config.extension,
     "--no-skills",
+    "--no-context-files",
     "--no-prompt-templates",
     "--approve",
     "--mode", "rpc",
   ];
 
+  const piProfile = join(runDirectory, "pi-profile");
+  mkdirSync(piProfile, { recursive: true });
+  const userModels = join(process.env.USERPROFILE, ".pi", "agent", "models.json");
+  if (config.provider === "local-code") {
+    const provider = existsSync(userModels) ? readJson(userModels).providers?.[config.provider] : null;
+    if (!provider || !/^http:\/\/(127\.0\.0\.1|localhost):8080(?:\/|$)/.test(provider.baseUrl)) throw new Error("Local provider must use the loopback llama.cpp endpoint.");
+    atomicJson(join(piProfile, "models.json"), { providers: { [config.provider]: provider } });
+  }
+  atomicJson(join(piProfile, "settings.json"), { compaction: { enabled: false } });
   const env = {
     ...process.env,
-    PI_CODING_AGENT_DIR: join(process.env.USERPROFILE, ".pi", "agent"),
+    PI_CODING_AGENT_DIR: piProfile,
     PI_CODING_AGENT_SESSION_DIR: config.piSessionDirectory,
     PI_OFFLINE: "1",
     PI_SKIP_VERSION_CHECK: "1",
@@ -571,8 +602,12 @@ async function runPi({ role, task, attempt, prompt }) {
     LOCAL_AUTOPILOT_RESULT_FILE: resultFile,
     LOCAL_AUTOPILOT_ACTIVITY_FILE: activityFile,
     LOCAL_AUTOPILOT_ACTION_FILE: userActionPath,
-    LOCAL_AUTOPILOT_BOOTSTRAP_PLAN_FILE: bootstrapPlanning ? planPath : "",
-    LOCAL_AUTOPILOT_BOOTSTRAP_TASKS_FILE: bootstrapPlanning ? tasksPath : "",
+    LOCAL_AUTOPILOT_BOOTSTRAP: bootstrapTask ? "1" : "0",
+    LOCAL_AUTOPILOT_GOAL_FILE: goalPath,
+    LOCAL_AUTOPILOT_BOOTSTRAP_PLAN_FILE: bootstrapTask ? planPath : "",
+    LOCAL_AUTOPILOT_BOOTSTRAP_TASKS_FILE: bootstrapTask ? tasksPath : "",
+    LOCAL_AUTOPILOT_SYSTEM_PROMPT: systemPrompt,
+    LOCAL_AUTOPILOT_READY_FILE: join(runDirectory, prefix + ".ready.json"),
     LOCAL_AUTOPILOT_REMOTE_HOST: remoteHost,
     LOCAL_AUTOPILOT_REMOTE_CWD: remoteCwd,
     LOCAL_AUTOPILOT_SSH_KEY: sshKeyPath,
@@ -594,12 +629,18 @@ async function runPi({ role, task, attempt, prompt }) {
   let settledWithoutResult = 0;
   let noProgressLoop = false;
   let lastAssistantText = "";
+  let infrastructureError = false;
+  let exited = false;
+  let continuationTimer = null;
+  let promptDeadline = null;
+  const successfulTools = new Set();
+  const pendingWrites = new Map();
   const recentEvents = [];
   const changedFiles = new Set();
-  const checkpointPath = join(runDirectory, `${task.id}.checkpoint.json`);
+  const checkpointPath = join(runDirectory, `${task.id}.${role}.checkpoint.json`);
 
   const saveCheckpoint = (phase) => {
-    atomicJson(checkpointPath, {
+    const value = {
       version: 1,
       taskId: task.id,
       phase,
@@ -609,26 +650,31 @@ async function runPi({ role, task, attempt, prompt }) {
       lastAssistantText: clip(lastAssistantText, 1200),
       changedFiles: [...changedFiles],
       recentEvents: recentEvents.slice(-16),
-    });
+    };
+    atomicJson(checkpointPath, value);
+    atomicJson(join(runDirectory, `${task.id}.checkpoint.json`), value);
   };
 
   const send = (value) => {
-    if (child.stdin.writable) child.stdin.write(`${JSON.stringify(value)}\n`);
+    if (!exited && child.stdin.writable && !child.stdin.destroyed) child.stdin.write(`${JSON.stringify(value)}\n`, () => {});
   };
 
   const abort = (reason) => {
     if (abortReason) return;
     abortReason = reason;
+    clearTimeout(continuationTimer);
+    clearTimeout(promptDeadline);
     send({ type: "clear_queue" });
     send({ type: "abort" });
     setTimeout(() => {
-      if (processAlive(child.pid)) child.kill();
+      if (!exited && processAlive(child.pid)) child.kill();
     }, 3000).unref();
   };
 
   const attemptTimeoutMinutes = numericLimit(config.attemptTimeoutMinutes);
-  const handoffTokens = contextHandoffLimit(config);
-  let contextCheckInFlight = false;
+  const handoffTokens = bootstrapTask && role === "reviewer"
+    ? Math.max(contextHandoffLimit(config), (Number(config.contextWindow) || 24576) - 4096)
+    : contextHandoffLimit(config);
   const timeout = Number.isFinite(attemptTimeoutMinutes)
     ? setTimeout(() => abort(`attempt exceeded ${config.attemptTimeoutMinutes} minutes`), attemptTimeoutMinutes * 60_000)
     : null;
@@ -644,27 +690,8 @@ async function runPi({ role, task, attempt, prompt }) {
       send({ id: "web-note-" + note.id, type: "steer", message: note.text });
     }
   }, 1000);
-  const contextPoll = setInterval(async () => {
-    if (abortReason || contextCheckInFlight) return;
-    contextCheckInFlight = true;
-    try {
-      const response = await fetch("http://127.0.0.1:8080/slots", { signal: AbortSignal.timeout(1500) });
-      if (!response.ok) return;
-      const slots = await response.json();
-      const activeSlot = Array.isArray(slots)
-        ? slots.find((slot) => slot?.is_processing && Number.isFinite(Number(slot?.n_prompt_tokens)))
-        : null;
-      const promptTokens = Number(activeSlot?.n_prompt_tokens);
-      if (Number.isFinite(promptTokens) && promptTokens >= handoffTokens) {
-        recentEvents.push({ at: now(), type: "context_handoff", promptTokens, threshold: handoffTokens });
-        saveCheckpoint("context-handoff");
-        abort(`context handoff: ${promptTokens} prompt tokens reached the ${handoffTokens} safe-session threshold`);
-      }
-    } catch {
-      // The server can be busy loading or ending a request. A later poll will retry.
-    } finally {
-      contextCheckInFlight = false;
-    }
+  const contextPoll = setInterval(() => {
+    if (!abortReason && !exited) send({ id: "context-usage", type: "get_session_stats" });
   }, 2000);
 
   child.stderr.on("data", (chunk) => appendFileSync(stderrLog, chunk));
@@ -679,7 +706,18 @@ async function runPi({ role, task, attempt, prompt }) {
       return;
     }
 
-    if (event.type === "response" && event.id === "task-prompt" && event.success) {
+    if (event.type === "extension_error" || (event.type === "response" && event.success === false && !pendingNotes.has(event.id))) {
+      infrastructureError = true;
+      abort("Pi command/extension error: " + clip(event.error || event.message || JSON.stringify(event), 1000));
+    } else if (event.type === "response" && event.id === "context-usage") {
+      const tokens = event.data?.contextUsage?.tokens;
+      if (!abortReason && !exited && typeof tokens === "number" && tokens >= handoffTokens) {
+        recentEvents.push({ at: now(), type: "context_handoff", promptTokens: tokens, threshold: handoffTokens });
+        saveCheckpoint("context-handoff");
+        abort("context handoff: this Pi session reached " + tokens + " prompt tokens");
+      }
+    } else if (event.type === "response" && event.id === "task-prompt" && event.success) {
+      clearTimeout(promptDeadline);
       for (const note of startupNotes) webNoteReceipt(note.id, "included");
     } else if (event.type === "response" && pendingNotes.has(event.id)) {
       const note = pendingNotes.get(event.id);
@@ -697,12 +735,20 @@ async function runPi({ role, task, attempt, prompt }) {
       recentEvents.push({ at: now(), type: "tool_start", tool: event.toolName, input: clip(argsText, 500) });
       if (["write", "edit"].includes(event.toolName)) {
         const path = event.args?.path;
-        if (path) changedFiles.add(String(path));
+        if (path) pendingWrites.set(event.toolCallId, String(path));
       }
       saveCheckpoint("working");
     } else if (event.type === "tool_execution_end") {
+      if (!event.isError) {
+        successfulTools.add(event.toolName);
+        if (pendingWrites.has(event.toolCallId)) changedFiles.add(pendingWrites.get(event.toolCallId));
+      }
       process.stdout.write(`[tool] ${event.toolName} ${event.isError ? "ERROR" : "ok"}\n`);
       const toolResultText = JSON.stringify(event.result ?? event.output ?? "");
+      if (toolResultText.includes("LOCAL_AUTOPILOT_SANDBOX_UNAVAILABLE")) {
+        infrastructureError = true;
+        abort("Debian needs bubblewrap for read-only review; no writable fallback was used");
+      }
       recentEvents.push({
         at: now(),
         type: "tool_end",
@@ -718,6 +764,10 @@ async function runPi({ role, task, attempt, prompt }) {
       }
       saveCheckpoint(event.isError ? "repair-needed" : "working");
     } else if (event.type === "message_end") {
+      if (event.message?.stopReason === "error") {
+        infrastructureError = true;
+        abort("Model request failed: " + clip(event.message.errorMessage, 1000));
+      }
       const text = extractAssistantText(event.message);
       if (text) {
         lastAssistantText = text;
@@ -731,14 +781,17 @@ async function runPi({ role, task, attempt, prompt }) {
       abort("context handoff: automatic compaction was requested; preserving the checkpoint and starting a clean session instead");
     } else if (event.type === "agent_settled") {
       settled = true;
+      if (abortReason || interrupted || existsSync(stopPath)) { child.stdin.end(); return; }
       saveCheckpoint("settled-without-result");
       if (existsSync(resultFile)) {
-        child.kill();
+        child.stdin.end();
       } else if (compactions > 0 || settledWithoutResult >= 1) {
         abort("context handoff: session settled repeatedly without a structured result");
       } else {
         settledWithoutResult += 1;
-        setTimeout(() => send({
+        continuationTimer = setTimeout(() => {
+          if (abortReason || interrupted || exited || existsSync(stopPath)) return;
+          send({
           id: `continue-${Date.now()}`,
           type: "prompt",
           message: [
@@ -746,30 +799,46 @@ async function runPi({ role, task, attempt, prompt }) {
             "Use the work and tool results already in this session and the durable checkpoint. Do not repeat broad discovery.",
             `Take the smallest concrete next action toward the acceptance criteria, verify it, and call ${finishTool} when complete or genuinely blocked.`,
           ].join(" "),
-        }), 250);
+          });
+        }, 250);
       }
     }
   });
 
   child.on("error", (error) => {
+    infrastructureError = true;
+    abortReason ||= "Could not start Pi: " + error.message;
     appendFileSync(stderrLog, `${error.stack ?? error}\n`, "utf8");
   });
-
-  send({ type: "set_steering_mode", mode: "one-at-a-time" });
-  send({ type: "set_follow_up_mode", mode: "one-at-a-time" });
-  send({ type: "set_auto_compaction", enabled: false });
-  send({ id: "task-prompt", type: "prompt", message: prompt });
-
-  await new Promise((resolvePromise) => {
-    child.on("exit", (code) => {
-      exitCode = code;
-      resolvePromise();
-    });
+  child.stdin.on("error", error => {
+    if (!abortReason && !settled) { infrastructureError = true; abort("Pi input failed: " + error.message); }
   });
+  const closed = new Promise(resolvePromise => {
+    child.once("close", code => { exitCode = code; exited = true; resolvePromise(); });
+  });
+
+  const readyDeadline = Date.now() + 15000;
+  while (!exited && !abortReason && !existsSync(env.LOCAL_AUTOPILOT_READY_FILE) && Date.now() < readyDeadline) await new Promise(r => setTimeout(r, 50));
+  if (!exited && !abortReason) {
+    const manifest = existsSync(env.LOCAL_AUTOPILOT_READY_FILE) ? readJson(env.LOCAL_AUTOPILOT_READY_FILE) : null;
+    if (manifest?.protocol !== PROTOCOL_VERSION || manifest.role !== role || manifest.taskId !== task.id || JSON.stringify([...(manifest.tools || [])].sort()) !== JSON.stringify([...expectedTools].sort())) {
+      infrastructureError = true;
+      abort("Pi extension tool handshake failed. Expected: " + tools + ". No model prompt was sent.");
+    } else {
+      send({ id: "steering-mode", type: "set_steering_mode", mode: "one-at-a-time" });
+      send({ id: "follow-up-mode", type: "set_follow_up_mode", mode: "one-at-a-time" });
+      send({ id: "auto-compaction", type: "set_auto_compaction", enabled: false });
+      promptDeadline = setTimeout(() => { infrastructureError = true; abort("Pi did not acknowledge the prompt within 15 seconds"); }, 15000);
+      send({ id: "task-prompt", type: "prompt", message: prompt });
+    }
+  }
+  await closed;
   if (timeout) clearTimeout(timeout);
   clearInterval(stopPoll);
   clearInterval(notePoll);
   clearInterval(contextPoll);
+  clearTimeout(continuationTimer);
+  clearTimeout(promptDeadline);
   lines.close();
   activeChild = null;
 
@@ -777,157 +846,137 @@ async function runPi({ role, task, attempt, prompt }) {
   if (existsSync(resultFile)) {
     try {
       result = readJson(resultFile);
+      validateResult(result, role, task.id, bootstrapTask);
+      if (!successfulTools.has(finishTool) && !successfulTools.has("request_user_action")) throw new Error("No successful finalizer tool event for the saved result");
     } catch (error) {
+      result = null;
       abortReason ||= `invalid result JSON: ${error.message}`;
     }
   }
   return {
-    result, settled, exitCode, abortReason, toolCalls, compactions, noProgressLoop,
+    result, settled, exitCode, abortReason, toolCalls, compactions, noProgressLoop, infrastructureError: infrastructureError || (!abortReason && exitCode !== 0),
     contextHandoff: abortReason.startsWith("context handoff:"), rpcLog, stderrLog,
   };
 }
 
 async function main() {
-  let taskIndex = 0;
-  while (taskIndex < state.tasks.length) {
-    const taskState = state.tasks[taskIndex];
-    if (taskState.status === "done") {
-      taskIndex += 1;
-      continue;
-    }
+  while (true) {
+    const taskState = state.tasks.find(item => item.status !== "done");
+    if (!taskState) break;
     const task = taskDefinitions.get(taskState.id);
-    if (!task) fail(`task definition missing: ${taskState.id}`);
-
+    if (!task) throw new Error("Task definition missing: " + taskState.id);
+    const stopped = message => {
+      if (!existsSync(stopPath) && !interrupted) return false;
+      taskState.status = "pending";
+      state.status = "stopped";
+      saveState(state, message);
+      return true;
+    };
+    if (stopped("Stopped before task " + task.id)) return;
+    state.currentTaskId = task.id;
     if (task.requiresUserApproval) {
       taskState.status = "waiting";
       state.status = "waiting-user";
-      state.currentTaskId = task.id;
-      saveState(state, `Task ${task.id} requires explicit user authorization: ${task.title}`);
-      process.stdout.write(`[autopilot] PAUSED before ${task.id}: explicit user authorization required.\n`);
+      saveState(state, "Task " + task.id + " requires explicit user authorization: " + task.title);
       return;
     }
 
+    const bootstrap = isBootstrapTask(task);
+    const ticketPath = join(runDirectory, task.id + ".pending-review.json");
+    const fingerprint = digest({ task, goal });
+    let ticket = existsSync(ticketPath) ? readJson(ticketPath) : null;
+    if (ticket?.fingerprint !== fingerprint) {
+      ticket = null;
+      rmSync(ticketPath, { force: true });
+    }
     taskState.status = "running";
-    state.currentTaskId = task.id;
-    saveState(state, `Starting task ${task.id}: ${task.title}`);
-    let accepted = false;
-    let replanned = false;
-
-    while (!accepted) {
-      taskState.attempts += 1;
-      saveState(state, `Worker attempt ${taskState.attempts} for task ${task.id}`);
-      const worker = await runPi({
-        role: "worker",
-        task,
-        attempt: taskState.attempts,
-        prompt: buildWorkerPrompt(task, taskState.attempts, taskState.lastIssues ?? []),
-      });
-
-      if (existsSync(stopPath) || interrupted) {
-        taskState.status = "pending";
-        state.status = "stopped";
-        saveState(state, `Stopped during task ${task.id}`);
-        return;
-      }
-      if (!worker.result) {
-        const workerFailure = worker.abortReason || `worker exited without finish_step (exit=${worker.exitCode}, settled=${worker.settled})`;
-        taskState.lastIssues = [workerFailure];
-        saveState(state, `Worker attempt ${taskState.attempts} failed without a structured result`);
-        if (worker.contextHandoff) {
-          saveState(state, `Context handoff for task ${task.id}; continuing from durable checkpoint in a clean session`);
-          process.stdout.write(`[autopilot] CONTEXT HANDOFF ${task.id}: clean session will resume from checkpoint\n`);
+    let taskFinished = false;
+    while (!taskFinished) {
+      if (stopped("Stopped during task " + task.id)) return;
+      if (!ticket) {
+        taskState.attempts += 1;
+        state.status = bootstrap ? "planning" : "running";
+        saveState(state, "Worker attempt " + taskState.attempts + " for task " + task.id);
+        const worker = await runPi({
+          role: "worker", task, attempt: taskState.attempts,
+          prompt: buildWorkerPrompt(task, taskState.attempts, taskState.lastIssues ?? []),
+        });
+        if (stopped("Stopped during task " + task.id)) return;
+        if (worker.infrastructureError) throw new Error(worker.abortReason || "Pi runtime failed; see " + worker.stderrLog);
+        if (!worker.result) {
+          const reason = worker.abortReason || "Worker returned no structured result";
+          taskState.lastIssues = [reason];
+          saveState(state, reason);
+          if (worker.noProgressLoop && !bootstrap) {
+            state.status = "planning";
+            saveState(state, "Recovery planner is reframing stalled task " + task.id);
+            const recovery = await runPi({ role: "planner", task, attempt: taskState.attempts, prompt: buildRecoveryPlanPrompt(task, reason) });
+            if (stopped("Stopped during recovery planning for task " + task.id)) return;
+            if (recovery.infrastructureError) throw new Error(recovery.abortReason);
+            try {
+              const replacements = applyRecoveryPlan(task, recovery.result);
+              reloadTasksIntoState(state);
+              saveState(state, "Replanned " + task.id + " into " + replacements.length + " steps");
+              taskFinished = true;
+            } catch (error) {
+              taskState.lastIssues = [reason, "Recovery plan failed: " + error.message];
+              saveState(state);
+            }
+          }
           continue;
         }
-        if (worker.noProgressLoop) {
-          saveState(state, `Recovery planner is reframing stalled task ${task.id}`);
-          const recovery = await runPi({
-            role: "planner",
-            task,
-            attempt: taskState.attempts,
-            prompt: buildRecoveryPlanPrompt(task, workerFailure),
-          });
-          if (existsSync(stopPath) || interrupted) {
-            taskState.status = "pending";
-            state.status = "stopped";
-            saveState(state, `Stopped during recovery planning for task ${task.id}`);
-            return;
-          }
-          try {
-            const replacements = applyRecoveryPlan(task, recovery.result);
-            reloadTasksIntoState(state);
-            state.status = "running";
-            state.currentTaskId = null;
-            saveState(state, `Task ${task.id} reframed into ${replacements.length} focused recovery steps`);
-            process.stdout.write(`[autopilot] REPLANNED ${task.id}: ${replacements.map((item) => item.id).join(", ")}\n`);
-            replanned = true;
-            break;
-          } catch (error) {
-            taskState.lastIssues = [workerFailure, `Recovery planner did not return a usable plan: ${error.message}`];
-            saveState(state, `Recovery planner failed for task ${task.id}`);
-          }
+        if (worker.result.status === "blocked") {
+          taskState.status = "blocked";
+          taskState.lastIssues = [worker.result.blocker || worker.result.summary];
+          state.status = "blocked";
+          saveState(state, "Task " + task.id + " needs user action: " + taskState.lastIssues[0]);
+          return;
         }
-        continue;
-      }
-      if (worker.result.status === "blocked") {
-        taskState.status = "blocked";
-        taskState.lastIssues = [worker.result.blocker || worker.result.summary];
-        state.status = "blocked";
-        const actionHint = worker.result.actionFile ? ` See ${worker.result.actionFile}` : "";
-        saveState(state, `Task ${task.id} blocked: ${taskState.lastIssues[0]}${actionHint}`);
-        process.stdout.write(`[autopilot] BLOCKED ${task.id}: ${taskState.lastIssues[0]}\n`);
-        return;
+        if (bootstrap) checkProposal(planningPaths, worker.result.planRevision);
+        ticket = { fingerprint, taskId: task.id, worker: worker.result, reviewAttempts: 0 };
+        atomicJson(ticketPath, ticket);
       }
 
-      saveState(state, `Reviewing worker attempt ${taskState.attempts} for task ${task.id}`);
+      // A completed worker is never repeated because a reviewer ran out of context or was stopped.
+      state.status = "reviewing";
+      ticket.reviewAttempts += 1;
+      atomicJson(ticketPath, ticket);
+      saveState(state, "Review " + ticket.reviewAttempts + " for task " + task.id + "; worker result preserved");
+      const reviewCheckpointPath = join(runDirectory, task.id + ".reviewer.checkpoint.json");
+      const reviewContext = ticket.reviewAttempts > 1 && existsSync(reviewCheckpointPath)
+        ? "\nPrior review observations (verify and continue without repeating them):\n" + JSON.stringify(readJson(reviewCheckpointPath)) : "";
       const review = await runPi({
-        role: "reviewer",
-        task,
-        attempt: taskState.attempts,
-        prompt: buildReviewPrompt(task, worker.result),
+        role: "reviewer", task, attempt: ticket.reviewAttempts,
+        prompt: buildReviewPrompt(task, ticket.worker) + reviewContext,
       });
-      if (existsSync(stopPath) || interrupted) {
-        taskState.status = "pending";
-        state.status = "stopped";
-        saveState(state, `Stopped during review of task ${task.id}`);
-        return;
-      }
+      if (stopped("Stopped during review of task " + task.id)) return;
+      if (review.infrastructureError) throw new Error(review.abortReason);
       if (!review.result) {
-        taskState.lastIssues = [review.abortReason || `reviewer exited without finish_review (exit=${review.exitCode})`];
-        saveState(state, `Review attempt ${taskState.attempts} failed without a verdict`);
-        if (review.contextHandoff) {
-          saveState(state, `Reviewer context handoff for task ${task.id}; retrying independent review in a clean session`);
-        }
+        taskState.lastIssues = [review.abortReason || "Reviewer returned no verdict; retrying review only"];
+        saveState(state, "Continuing independent review of " + task.id + "; worker not repeated");
         continue;
       }
       if (!review.result.approved) {
-        taskState.lastIssues = review.result.issues?.length ? review.result.issues : [review.result.summary];
-        saveState(state, `Review rejected task ${task.id}: ${taskState.lastIssues.join("; ")}`);
-        process.stdout.write(`[autopilot] REVIEW REJECTED ${task.id}: ${clip(taskState.lastIssues.join("; "), 500)}\n`);
+        taskState.lastIssues = review.result.issues.length ? review.result.issues : [review.result.summary];
+        saveState(state, "Review rejected " + task.id + ": " + taskState.lastIssues.join("; "));
+        rmSync(ticketPath, { force: true });
+        ticket = null;
         continue;
       }
-
-      accepted = true;
+      if (bootstrap) commitPlan(planningPaths, ticket.worker.planRevision, review.result);
       taskState.status = "done";
       taskState.completedAt = now();
       taskState.lastIssues = [];
-      appendJournal(task, worker.result, review.result);
+      appendJournal(task, ticket.worker, review.result);
       rmSync(userActionPath, { force: true });
-      const planUpdated = markPlanDone(task.id);
-      saveState(state, `Task ${task.id} accepted${planUpdated ? " and PLAN.md updated" : ""}`);
-      process.stdout.write(`[autopilot] ACCEPTED ${task.id}: ${review.result.summary}\n`);
+      markPlanDone(task.id);
+      saveState(state, "Task " + task.id + " accepted");
+      rmSync(ticketPath, { force: true });
       reloadTasksIntoState(state);
       saveState(state);
-      taskIndex = 0;
-      continue;
+      taskFinished = true;
     }
-
-    if (replanned) {
-      taskIndex = 0;
-      continue;
-    }
-    taskIndex += 1;
   }
-
   state.status = "complete";
   state.currentTaskId = null;
   saveState(state, "All authorized tasks are complete");

@@ -37,6 +37,7 @@ project folders, browser profiles, or credentials are tracked in this repo.
 
 See [docs/AUTOPILOT.md](docs/AUTOPILOT.md) for the planner-first workflow.
 See [docs/WEB_UI.md](docs/WEB_UI.md) for the browser interface and installation.
+See [docs/PIPELINE.md](docs/PIPELINE.md) for staged plans, review/resume behavior, and regression tests.
 
 ## Security model
 

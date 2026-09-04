@@ -22,6 +22,7 @@ test("UI API preserves local project ownership, settings and launcher lifecycle"
   for (const path of [projects, join(ai, "autopilot"), join(ai, "launcher")]) mkdirSync(path, { recursive: true });
   copyFileSync(join(autopilotRoot, "local-autopilot.ps1"), join(ai, "autopilot", "local-autopilot.ps1"));
   copyFileSync(join(autopilotRoot, "supervisor.mjs"), join(ai, "autopilot", "supervisor.mjs"));
+  copyFileSync(join(autopilotRoot, "plan-store.mjs"), join(ai, "autopilot", "plan-store.mjs"));
   // Exercise the real scaffold/wrapper with a GPU-free launcher fixture.
   writeFileSync(join(ai, "launcher", "local-code.ps1"), [
     'param([Parameter(ValueFromRemainingArguments=$true)][string[]]$ArgsList)',

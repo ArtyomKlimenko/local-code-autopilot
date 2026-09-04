@@ -1,22 +1,25 @@
 import { writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
+import { PROTOCOL_VERSION, toolNames } from "../../autopilot/plan-store.mjs";
 
 const role = process.env.LOCAL_AUTOPILOT_ROLE;
 const taskId = process.env.LOCAL_AUTOPILOT_TASK_ID;
 const resultFile = process.env.LOCAL_AUTOPILOT_RESULT_FILE;
 const send = event => process.stdout.write(JSON.stringify(event) + "\n");
+writeFileSync(process.env.LOCAL_AUTOPILOT_READY_FILE, JSON.stringify({ protocol: PROTOCOL_VERSION, role, taskId, tools: toolNames(role, false) }));
 function finish() {
   const result = role === "reviewer"
     ? { kind: "review", taskId, approved: true, summary: "UI fixture reviewed", issues: [], verification: ["fixture"] }
     : { kind: "worker", taskId, status: "complete", summary: "UI fixture done", changedFiles: [], verification: ["fixture"], evidence: ["PASS"], blocker: "" };
   writeFileSync(resultFile, JSON.stringify(result));
+  send({ type: "tool_execution_end", toolName: role === "reviewer" ? "finish_review" : "finish_step", isError: false, result: {} });
   send({ type: "agent_settled" });
 }
 createInterface({ input: process.stdin }).on("line", line => {
   const request = JSON.parse(line);
   send({ type: "response", id: request.id, command: request.type, success: true });
   if (request.type === "prompt") {
-    const promptIndex = process.argv.indexOf("--append-system-prompt");
+    const promptIndex = process.argv.indexOf("--system-prompt");
     if (!process.argv[promptIndex + 1].includes("Initial UI note")) throw new Error("Initial note missing from agent context");
     if (role === "reviewer") finish();
     else send({ type: "message_start", message: { role: "assistant", content: [] } });
