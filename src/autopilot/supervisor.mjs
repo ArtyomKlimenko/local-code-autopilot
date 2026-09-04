@@ -24,6 +24,17 @@ function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8").replace(/^\uFEFF/, ""));
 }
 
+function readWebNotes() {
+  try {
+    const notes = readJson(join(projectRoot, ".agent", "web-notes.json"));
+    return Array.isArray(notes) ? notes.filter(note => /^[\w-]+$/.test(note.id) && typeof note.text === "string") : [];
+  } catch { return []; }
+}
+
+function webNoteReceipt(id, status, error) {
+  atomicJson(join(projectRoot, ".agent", "web-receipts", id + ".json"), { status, error, atStatus: now() });
+}
+
 function atomicJson(path, value) {
   mkdirSync(dirname(path), { recursive: true });
   const temp = `${path}.${process.pid}.tmp`;
@@ -251,6 +262,17 @@ if (command === "stop") {
 
 if (command !== "start") fail(`unknown command: ${command}`);
 
+if (process.env.LOCAL_AUTOPILOT_WEB_LAUNCH_ID) {
+  const webLaunchPath = join(projectRoot, ".agent", "web-launch.json");
+  if (existsSync(webLaunchPath)) {
+    const webLaunch = readJson(webLaunchPath);
+    if (webLaunch.launchId === process.env.LOCAL_AUTOPILOT_WEB_LAUNCH_ID && webLaunch.stopRequested) {
+      process.stdout.write("[autopilot] Web launch cancelled during GPU startup.\n");
+      process.exit(0);
+    }
+  }
+}
+
 for (const required of [tasksPath, goalPath, planPath, config.nodeExecutable, config.piCli, config.extension]) {
   if (!existsSync(required)) fail(`required file not found: ${required}`);
 }
@@ -470,6 +492,9 @@ function extractAssistantText(message) {
 }
 
 async function runPi({ role, task, attempt, prompt }) {
+  const startupNotes = readWebNotes();
+  const sentNotes = new Set(startupNotes.map(note => note.id));
+  const pendingNotes = new Map();
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const prefix = `${stamp}-${task.id}-${role}-a${attempt}`;
   const resultFile = join(runDirectory, `${prefix}.result.json`);
@@ -492,6 +517,7 @@ async function runPi({ role, task, attempt, prompt }) {
     ? `read,bash,edit,write,request_user_action,${finishTool}`
     : `read,bash,${finishTool}`;
   const systemPrompt = [
+    ...startupNotes.flatMap(note => ["User clarification (" + note.at + "):", note.text]),
     `Autopilot role: ${role}. Assigned task: ${task.id}.`,
     "Never read, print, copy, encode, summarize, or inspect private SSH key contents. Use only the supplied key path with ssh -i.",
     "Never perform broad filesystem, dependency, cache, browser-profile, AppData, or root scans.",
@@ -609,6 +635,15 @@ async function runPi({ role, task, attempt, prompt }) {
   const stopPoll = setInterval(() => {
     if (existsSync(stopPath) || interrupted) abort(existsSync(stopPath) ? "stop requested" : "interrupted");
   }, 1000);
+  const notePoll = setInterval(() => {
+    if (abortReason || interrupted || !child.stdin.writable) return;
+    for (const note of readWebNotes()) {
+      if (sentNotes.has(note.id)) continue;
+      sentNotes.add(note.id);
+      pendingNotes.set("web-note-" + note.id, note);
+      send({ id: "web-note-" + note.id, type: "steer", message: note.text });
+    }
+  }, 1000);
   const contextPoll = setInterval(async () => {
     if (abortReason || contextCheckInFlight) return;
     contextCheckInFlight = true;
@@ -644,7 +679,18 @@ async function runPi({ role, task, attempt, prompt }) {
       return;
     }
 
-    if (event.type === "tool_execution_start") {
+    if (event.type === "response" && event.id === "task-prompt" && event.success) {
+      for (const note of startupNotes) webNoteReceipt(note.id, "included");
+    } else if (event.type === "response" && pendingNotes.has(event.id)) {
+      const note = pendingNotes.get(event.id);
+      webNoteReceipt(note.id, event.success ? "queued" : "error", event.error);
+    } else if (event.type === "message_start" && event.message?.role === "user") {
+      const content = event.message.content;
+      const messageText = typeof content === "string" ? content : (content || []).map(item => item.text || "").join("\n");
+      for (const note of pendingNotes.values()) {
+        if (messageText === note.text) webNoteReceipt(note.id, "delivered");
+      }
+    } else if (event.type === "tool_execution_start") {
       toolCalls += 1;
       const argsText = JSON.stringify(event.args ?? {});
       process.stdout.write(`[tool ${toolCalls}] ${event.toolName}: ${clip(argsText, 220)}\n`);
@@ -722,6 +768,7 @@ async function runPi({ role, task, attempt, prompt }) {
   });
   if (timeout) clearTimeout(timeout);
   clearInterval(stopPoll);
+  clearInterval(notePoll);
   clearInterval(contextPoll);
   lines.close();
   activeChild = null;

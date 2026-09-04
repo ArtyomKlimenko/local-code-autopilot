@@ -16,6 +16,8 @@ worker/reviewer supervisor.
   as a failed hypothesis, not a reason to burn context.
 - Recovery planner that replaces a stalled broad task with focused,
   independently verifiable steps.
+- Local Preact web workspace: projects, live Pi messages and tool results,
+  plans, start/stop/resume, user clarifications, GPU state and SSH checks.
 
 ## Not Included
 
@@ -34,6 +36,7 @@ project folders, browser profiles, or credentials are tracked in this repo.
    elevated process gets a different Vulkan runtime.
 
 See [docs/AUTOPILOT.md](docs/AUTOPILOT.md) for the planner-first workflow.
+See [docs/WEB_UI.md](docs/WEB_UI.md) for the browser interface and installation.
 
 ## Security model
 

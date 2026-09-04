@@ -26,3 +26,10 @@ config/*.local.json
 .idea/
 Thumbs.db
 Desktop.ini
+
+# Web UI build and local machine state
+node_modules/
+src/web/dist/
+src/web/machine.json
+output/
+.playwright-cli/

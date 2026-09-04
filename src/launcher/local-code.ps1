@@ -30,6 +30,7 @@ $DefaultAutopilotConfig = $env:LOCAL_CODE_AUTOPILOT_CONFIG
 $LogDir = Join-Path $BaseDir "logs"
 $StateDir = Join-Path $BaseDir "state"
 $PidFile = Join-Path $StateDir "llama-server.pid"
+$GpuProofFile = Join-Path $StateDir "gpu-proof.json"
 $OkHashFile = Join-Path $StateDir "Ornith-1.5-9B-Abliterated-Q4_K_M.gguf.sha256.ok"
 $AlyaRoot = if ($env:LOCAL_CODE_ALYA_ROOT) { $env:LOCAL_CODE_ALYA_ROOT } else { Join-Path $BaseDir "alya-disabled" }
 $AlyaScripts = Join-Path $AlyaRoot "scripts"
@@ -445,8 +446,16 @@ function Start-LlamaServer([int]$ContextSize) {
     if (Test-ServerHealth) {
       $serverCtx = Get-ServerContextSize
       if ($serverCtx -eq $ContextSize) {
-        Write-Ok "local llama-server already healthy on 127.0.0.1:8080 with ctx=$ContextSize"
-        return $false
+        $proof = $null
+        try { $proof = Get-Content -LiteralPath $GpuProofFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+        $existingProcess = Get-Process -Id $owners[0].Pid -ErrorAction SilentlyContinue
+        if ($proof -and $existingProcess -and $proof.pid -eq $existingProcess.Id -and
+            [math]::Abs(($existingProcess.StartTime.ToUniversalTime() - ([datetime]$proof.processStartedAt).ToUniversalTime()).TotalSeconds) -lt 2) {
+          Assert-GpuOnlyLog -OutLog $proof.outLog -ErrLog $proof.errLog
+          Write-Ok "local llama-server already healthy and GPU-verified on 127.0.0.1:8080 with ctx=$ContextSize"
+          return $false
+        }
+        Write-Info "restarting local llama-server: no GPU proof for the current process"
       }
       Write-Info "restarting local llama-server to switch ctx=$serverCtx -> ctx=$ContextSize"
       Stop-LocalServer
@@ -507,6 +516,16 @@ function Start-LlamaServer([int]$ContextSize) {
     if (Test-ServerHealth) {
       Write-Ok "llama-server health OK"
       Assert-GpuOnlyLog -OutLog $outLog -ErrLog $errLog
+      @{
+        pid = $proc.Id
+        processStartedAt = $proc.StartTime.ToUniversalTime().ToString("o")
+        contextSize = $ContextSize
+        device = $gpuDevice
+        gpuName = $GpuNamePattern
+        outLog = $outLog
+        errLog = $errLog
+        verifiedAt = (Get-Date).ToUniversalTime().ToString("o")
+      } | ConvertTo-Json | Set-Content -LiteralPath $GpuProofFile -Encoding UTF8
       return $true
     }
   }
