@@ -20,6 +20,9 @@ import { Type } from "typebox";
 const resultFile = process.env.LOCAL_AUTOPILOT_RESULT_FILE || "";
 const activityFile = process.env.LOCAL_AUTOPILOT_ACTIVITY_FILE || "";
 const actionFile = process.env.LOCAL_AUTOPILOT_ACTION_FILE || "";
+const bootstrapPlanFile = process.env.LOCAL_AUTOPILOT_BOOTSTRAP_PLAN_FILE || "";
+const bootstrapTasksFile = process.env.LOCAL_AUTOPILOT_BOOTSTRAP_TASKS_FILE || "";
+const bootstrapPlanning = Boolean(bootstrapPlanFile && bootstrapTasksFile);
 const role = process.env.LOCAL_AUTOPILOT_ROLE || "worker";
 const taskId = process.env.LOCAL_AUTOPILOT_TASK_ID || "unknown";
 const remoteHost = process.env.LOCAL_AUTOPILOT_REMOTE_HOST || "";
@@ -283,6 +286,59 @@ const finishStep = defineTool({
 	},
 });
 
+const saveBootstrapPlan = defineTool({
+	name: "save_bootstrap_plan",
+	label: "Save bootstrap plan",
+	description: "Save the new run's plan and task list to the local control directory after remote inspection.",
+	promptSnippet: "Persist the new local control plan without editing the remote project's legacy control files",
+	promptGuidelines: [
+		"Use this only for bootstrap planning after bounded remote inspection.",
+		"Do not write PLAN.md or .agent/tasks.json through remote write/edit tools during bootstrap.",
+		"The task list must be valid JSON with a non-empty tasks array and must not include task 0.1.",
+	],
+	parameters: Type.Object({
+		planMarkdown: Type.String({ description: "Full markdown content for the local PLAN.md" }),
+		tasksJson: Type.String({ description: "Full JSON content for the local .agent/tasks.json" }),
+		summary: Type.String({ description: "Concise description of the plan" }),
+	}),
+	async execute(_id, params) {
+		let tasksDocument: { tasks?: Array<{ id?: string }> };
+		try {
+			tasksDocument = JSON.parse(params.tasksJson) as { tasks?: Array<{ id?: string }> };
+		} catch (error) {
+			throw new Error(`tasksJson is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		if (!Array.isArray(tasksDocument.tasks) || tasksDocument.tasks.length === 0) {
+			throw new Error("tasksJson must contain a non-empty tasks array");
+		}
+		if (tasksDocument.tasks.some((task) => task?.id === "0.1")) {
+			throw new Error("tasksJson must not retain the bootstrap 0.1 task");
+		}
+		mkdirSync(dirname(bootstrapPlanFile), { recursive: true });
+		mkdirSync(dirname(bootstrapTasksFile), { recursive: true });
+		writeFileSync(bootstrapPlanFile, `${params.planMarkdown.trim()}\n`, "utf8");
+		writeFileSync(bootstrapTasksFile, `${JSON.stringify(tasksDocument, null, 2)}\n`, "utf8");
+		const value = {
+			kind: "worker",
+			taskId,
+			at: new Date().toISOString(),
+			status: "complete",
+			summary: params.summary,
+			changedFiles: ["PLAN.md", ".agent/tasks.json"],
+			verification: ["Validated and saved the local bootstrap plan and task list"],
+			evidence: [`${tasksDocument.tasks.length} planned tasks saved outside the remote project`],
+			blocker: "",
+		};
+		saveJson(resultFile, value);
+		logActivity({ type: "save_bootstrap_plan", taskId, tasks: tasksDocument.tasks.length });
+		return {
+			content: [{ type: "text", text: `Bootstrap plan saved for ${taskId}: ${tasksDocument.tasks.length} tasks` }],
+			details: value,
+			terminate: true,
+		};
+	},
+});
+
 const requestUserAction = defineTool({
 	name: "request_user_action",
 	label: "Request user action",
@@ -409,7 +465,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool(createReadTool(localCwd, { operations: createRemoteReadOps(localCwd) }));
 	pi.registerTool(createBashTool(localCwd, { operations: createRemoteBashOps(localCwd, progress) }));
 
-	if (role === "reviewer") {
+	if (bootstrapPlanning) {
+		pi.registerTool(saveBootstrapPlan);
+	} else if (role === "reviewer") {
 		pi.registerTool(finishReview);
 	} else if (role === "planner") {
 		pi.registerTool(finishReplan);

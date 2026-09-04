@@ -327,27 +327,29 @@ function markPlanDone(taskId) {
 
 function buildWorkerPrompt(task, attempt, previousIssues) {
   const checkpointPath = join(runDirectory, `${task.id}.checkpoint.json`);
-  const checkpoint = existsSync(checkpointPath) ? readJson(checkpointPath) : null;
   const canManagePlan = task.kind === "planner" || task.canManagePlan === true;
+  const checkpoint = !canManagePlan && existsSync(checkpointPath) ? readJson(checkpointPath) : null;
   return [
     "You are a worker controlled by a local deterministic supervisor.",
     `Execute ONLY task ${task.id}: ${task.title}.`,
     canManagePlan
-      ? "This is the bootstrap planning task. Read the goal, inspect the project, then replace PLAN.md and .agent/tasks.json with a small ordered implementation plan."
+      ? "This is the bootstrap planning task. Inspect the remote project, then save a small ordered implementation plan to the LOCAL control directory with save_bootstrap_plan."
       : "Do not start, plan, or partially implement any later task.",
     canManagePlan
-      ? "You may edit only PLAN.md and .agent/tasks.json for planning. Do not implement project changes in this task."
+      ? "Bootstrap has remote read/bash only. Do not write or edit any remote file, especially remote PLAN.md or remote .agent/*. Use save_bootstrap_plan exactly once when the plan is ready."
       : "Do not edit PLAN.md, .agent/tasks.json, .agent/state.json, or .agent/journal.md; the supervisor owns them.",
     "Do not read .agent/tasks.json or .agent/state.json; the assigned scope, acceptance criteria, and prior issues are already included below.",
     `All read/write/edit/bash tools already operate in ${remoteCwd} on ${remoteHost} through SSH. Never type ssh/scp yourself and never use Windows paths.`,
     "Do not read browser profile cache file bodies under multi-account/.cache; inspect only bounded directory structure and project code/config.",
-    "Read .agent/GOAL.md first, then inspect only files needed for this task.",
+    "Do not read remote .agent/GOAL.md, remote .agent/tasks.json, remote .agent/state.json, or remote PLAN.md: remote control files may belong to another run. The assigned scope, acceptance criteria, and known context below are authoritative. Inspect only source and runtime files needed for this task.",
     "Treat each command as a hypothesis. When the same command produces the same evidence, do not rerun it unchanged: explain what that evidence proves, then inspect a different bounded source or make a targeted repair.",
     `Task scope: ${task.scope}`,
     ...(task.knownContext?.length ? ["Known starting observations: verify them directly once, then do not repeat broad investigation:", ...task.knownContext.map((item) => `- ${item}`)] : []),
     "Acceptance criteria:",
     ...task.acceptance.map((item) => `- ${item}`),
     ...(canManagePlan ? [
+      "Authoritative local goal:",
+      goal,
       "Planning output rules:",
       "- PLAN.md must be a checklist of small task ids such as 1.1, 1.2, 1.3.",
       "- .agent/tasks.json must contain those same task ids and must not contain the bootstrap 0.1 task.",
@@ -363,21 +365,31 @@ function buildWorkerPrompt(task, attempt, previousIssues) {
     "Work in small verified edits. Keep every command and its output bounded. To check a server, start it in the background, retain its PID, poll its health endpoint with a bounded client, then clean up that PID with a trap. A foreground `timeout` followed by curl only proves the server was killed; do not use that pattern as a health check.",
     "After a rejected pass, repair the listed issue first. Do not restart broad discovery or rewrite working parts.",
     "Do not merely describe intended work. Make the in-scope changes and run focused verification.",
-    "Use request_user_action only after one focused check proves that an acceptance criterion cannot be met without a real external dependency (for example a proxy endpoint, account login, model endpoint, or explicit approval). Do not call it for code defects, failing tests, safely creatable project files, or ordinary uncertainty: repair or investigate those normally. Once the external dependency is proven missing, do not guess, fabricate configuration, or repeat discovery; request the smallest safe user action. Never request secrets in chat, logs, or repository files.",
-    "When verification passes, call finish_step. If your turn ends without it, the supervisor will continue the same session from its durable checkpoint.",
+    canManagePlan
+      ? "If later work will require user input, represent it as a narrow planned task with requiresUserApproval:true. Do not request it during bootstrap."
+      : "Use request_user_action only after one focused check proves that an acceptance criterion cannot be met without a real external dependency (for example a proxy endpoint, account login, model endpoint, or explicit approval). Do not call it for code defects, failing tests, safely creatable project files, or ordinary uncertainty: repair or investigate those normally. Once the external dependency is proven missing, do not guess, fabricate configuration, or repeat discovery; request the smallest safe user action. Never request secrets in chat, logs, or repository files.",
+    canManagePlan
+      ? "When the plan is ready, call save_bootstrap_plan. If your turn ends without it, the supervisor will continue the same session from its durable checkpoint."
+      : "When verification passes, call finish_step. If your turn ends without it, the supervisor will continue the same session from its durable checkpoint.",
   ].join("\n");
 }
 
 function buildReviewPrompt(task, workerResult) {
+  const canManagePlan = task.kind === "planner" || task.canManagePlan === true;
+  const localPlan = canManagePlan && existsSync(planPath) ? readFileSync(planPath, "utf8") : "";
+  const localTasks = canManagePlan && existsSync(tasksPath) ? readFileSync(tasksPath, "utf8") : "";
   return [
     "You are an independent read-only reviewer in a fresh session.",
     `Review ONLY task ${task.id}: ${task.title}.`,
     "You may read files and run focused non-mutating tests. You must not write or edit files.",
-    "Read .agent/GOAL.md and independently inspect the claimed changes.",
+    canManagePlan
+      ? "For this bootstrap review, inspect remote source files as needed but do not read remote .agent/ or remote PLAN.md; those belong to another run. The authoritative local goal and generated local plan are included below."
+      : "Inspect remote source and runtime files needed for this task, but do not read remote .agent/ or remote PLAN.md; those control files may belong to another run.",
     "Do not read .agent/tasks.json or .agent/state.json; the complete assigned task is included below.",
     `Task scope: ${task.scope}`,
     "Acceptance criteria:",
     ...task.acceptance.map((item) => `- ${item}`),
+    ...(canManagePlan ? ["Authoritative local goal:", goal, "Generated local PLAN.md:", localPlan, "Generated local .agent/tasks.json:", localTasks] : []),
     "Worker claim:",
     JSON.stringify(workerResult, null, 2),
     "Reject incomplete, untested, misplaced, unsafe, or out-of-scope work. Do not accept prose as evidence when a focused check is possible.",
@@ -466,26 +478,37 @@ async function runPi({ role, task, attempt, prompt }) {
   const stderrLog = join(runDirectory, `${prefix}.stderr.log`);
   rmSync(resultFile, { force: true });
 
-  const finishTool = role === "reviewer"
+  const bootstrapPlanning = role === "worker" && (task.kind === "planner" || task.canManagePlan === true);
+  const finishTool = bootstrapPlanning
+    ? "save_bootstrap_plan"
+    : role === "reviewer"
     ? "finish_review"
     : role === "planner"
       ? "finish_replan"
       : "finish_step";
-  const tools = role === "worker"
+  const tools = bootstrapPlanning
+    ? "read,bash,save_bootstrap_plan"
+    : role === "worker"
     ? `read,bash,edit,write,request_user_action,${finishTool}`
     : `read,bash,${finishTool}`;
   const systemPrompt = [
     `Autopilot role: ${role}. Assigned task: ${task.id}.`,
     "Never read, print, copy, encode, summarize, or inspect private SSH key contents. Use only the supplied key path with ssh -i.",
     "Never perform broad filesystem, dependency, cache, browser-profile, AppData, or root scans.",
-    `Every read/write/edit/bash tool is already redirected to ${remoteCwd} on ${remoteHost}. Never invoke ssh/scp yourself and never use a Windows path.`,
+    bootstrapPlanning
+      ? `Remote read and bash tools operate in ${remoteCwd} on ${remoteHost} through SSH. Bootstrap cannot write remote files; save_bootstrap_plan writes only the local control plan.`
+      : `Every read/write/edit/bash tool is already redirected to ${remoteCwd} on ${remoteHost} through SSH. Never invoke ssh/scp yourself and never use a Windows path.`,
     "Do not read browser profile cache file bodies under multi-account/.cache; inspect only bounded directory structure and project code/config.",
     "Do not run foreground servers or watchers as plain bash commands. For a server check: run it in the background, retain its PID, poll its health endpoint with a bounded client, and clean up that PID with a trap. Do not use bare pkill -f patterns. Treat an identical command and identical evidence as a failed hypothesis, not as a reason to retry it.",
-    role === "planner"
+    bootstrapPlanning
+      ? "You are the local-control bootstrap planner. Inspect remote source only, make no remote changes, and finish through save_bootstrap_plan."
+      : role === "planner"
       ? "You are read-only: do not edit files, start services, or make project changes. Return only a narrow recovery plan through finish_replan."
       : "VM project files and project-owned user services may be modified when the assigned task calls for it. Never change Windows host state, VirtualBox/host networking, VM firewall/networking, unrelated VM files, real browser-login profile data, or credentials.",
-    `End only through ${finishTool} or request_user_action.`,
-    role === "worker"
+    bootstrapPlanning
+      ? "End only through save_bootstrap_plan."
+      : `End only through ${finishTool} or request_user_action.`,
+    role === "worker" && !bootstrapPlanning
       ? "Use request_user_action only for a proven external prerequisite, never for ordinary failures. Once proven, end through request_user_action rather than guessing or repeating inspection."
       : "",
   ].join(" ");
@@ -522,6 +545,8 @@ async function runPi({ role, task, attempt, prompt }) {
     LOCAL_AUTOPILOT_RESULT_FILE: resultFile,
     LOCAL_AUTOPILOT_ACTIVITY_FILE: activityFile,
     LOCAL_AUTOPILOT_ACTION_FILE: userActionPath,
+    LOCAL_AUTOPILOT_BOOTSTRAP_PLAN_FILE: bootstrapPlanning ? planPath : "",
+    LOCAL_AUTOPILOT_BOOTSTRAP_TASKS_FILE: bootstrapPlanning ? tasksPath : "",
     LOCAL_AUTOPILOT_REMOTE_HOST: remoteHost,
     LOCAL_AUTOPILOT_REMOTE_CWD: remoteCwd,
     LOCAL_AUTOPILOT_SSH_KEY: sshKeyPath,
